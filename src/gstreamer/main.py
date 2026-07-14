@@ -22,7 +22,7 @@ from pollen_vision.camera_wrappers.depthai.utils import (
 from rclpy.executors import MultiThreadedExecutor
 
 from gstreamer.avpipeline import GstAVPipeline
-from gstreamer.ros_publisher import ROSPublisher
+from gstreamer.ros_publisher import ROSDepthPublisher, ROSPublisher
 
 
 def parse_args() -> argparse.Namespace:
@@ -91,10 +91,20 @@ def parse_args() -> argparse.Namespace:
         help="Disable hardware rectification",
     )
     parser.add_argument("--ros", action="store_true", help="pusblish camera images to ROS")
+    parser.add_argument(
+        "--tof",
+        action="store_true",
+        help="publish the head ToF depth map to ROS (requires --ros and a video stream)",
+    )
 
     add_signaling_arguments(parser)  # signalling args
 
-    return parser.parse_args()
+    args = parser.parse_args()
+
+    if args.tof and (not args.ros or args.stream == "audio"):
+        parser.error("--tof requires --ros and a video stream (--stream video or audiovideo)")
+
+    return args
 
 
 def configure_camera(args: argparse.Namespace) -> TeleopWrapper:
@@ -176,13 +186,31 @@ def configure_pipeline(
     return avpipeline, video_left, video_right
 
 
-def thread_ros_fun(teleop_wrapper: TeleopWrapper, asyncio_loop: asyncio.AbstractEventLoop, stop_event: asyncio.Event) -> None:
+def thread_tof_fun(teleop_wrapper: TeleopWrapper, depth_publisher: ROSDepthPublisher, stop_event: asyncio.Event) -> None:
+    """Drains the ToF depth queue and publishes to ROS.
+
+    Runs in its own thread: get_data_tof() blocks at the ToF fps, which must stay decoupled
+    from the MJPEG-paced loop of thread_ros_fun.
+    """
+    while not stop_event.is_set():
+        frame, latency, _ = teleop_wrapper.get_data_tof()
+        depth_publisher.publish_depth(frame, latency.microseconds * 1000)
+
+
+def thread_ros_fun(
+    teleop_wrapper: TeleopWrapper, asyncio_loop: asyncio.AbstractEventLoop, stop_event: asyncio.Event, tof: bool
+) -> None:
     rclpy.init()
     executor = MultiThreadedExecutor()
     rospublisher_left_cam = ROSPublisher(teleop_wrapper.cam_config, "left", asyncio_loop, stop_event)
     rospublisher_right_cam = ROSPublisher(teleop_wrapper.cam_config, "right", asyncio_loop, stop_event)
     executor.add_node(rospublisher_left_cam)
     executor.add_node(rospublisher_right_cam)
+    if tof:
+        depth_publisher = ROSDepthPublisher(teleop_wrapper.cam_config, asyncio_loop, stop_event)
+        executor.add_node(depth_publisher)
+        thread_tof = Thread(target=thread_tof_fun, args=(teleop_wrapper, depth_publisher, stop_event), daemon=True)
+        thread_tof.start()
     executor_thread = Thread(target=executor.spin, daemon=True)
     executor_thread.start()
     while not stop_event.is_set():
@@ -208,7 +236,9 @@ async def main_loop(args: argparse.Namespace) -> None:
     await avpipeline.start()
 
     if args.ros:
-        thread_ros = Thread(target=thread_ros_fun, args=(teleop_wrapper, asyncio.get_event_loop(), stop_event), daemon=True)
+        thread_ros = Thread(
+            target=thread_ros_fun, args=(teleop_wrapper, asyncio.get_event_loop(), stop_event, args.tof), daemon=True
+        )
         thread_ros.start()
 
     try:

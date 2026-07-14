@@ -42,6 +42,26 @@ python src/gstreamer/simple_consumer.py consumer --remote-producer-peer-id <peer
 ```
 THe peer_id can be get in the log of the signalling server
 
+### Head ToF depth (Reachy 2)
+
+If the camera config json contains `"tof": true` (see `CONFIG_IMX296.json`), the depthai pipeline
+decodes the head ToF module on-device. The ToF board socket is auto-detected at runtime (the only
+sensor reporting the ToF type). Add `--tof` (requires `--ros` and a video stream) to publish it to ROS:
+
+```console
+streaming_service --config CONFIG_IMX296 producer --name robot --stream audiovideo --ros --tof
+```
+
+- `teleop_camera/depth/image_raw`: `sensor_msgs/Image`, encoding `16UC1`, raw depth in **millimeters** (no scaling).
+- `teleop_camera/depth/camera_info`: `sensor_msgs/CameraInfo` at 1 Hz. If the device EEPROM has no intrinsics
+  for the ToF socket, approximate intrinsics are synthesized from the datasheet FoV (a warning is logged).
+
+The depth stream never enters the WebRTC/GStreamer pipeline; it is published to ROS only.
+`scripts/probe_tof.py` from the pollen-vision repo inspects the device (sockets, sensors, EEPROM intrinsics).
+Note that the runtime copy of the config json ships inside the pollen-vision package
+(`config_files_vision/`); the copy in `config/` here is a mirror kept in sync for humans.
+Known limits: the ToF is validated on USB3; on `--force-usb2` the raw ToF stream (~18 MB/s) may saturate the link.
+
 ## Debugging
 
 [Enable tracer](https://gstreamer.freedesktop.org/documentation//rstracers/buffer-lateness.html?gi-language=c)
