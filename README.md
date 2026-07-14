@@ -57,6 +57,8 @@ streaming_service --config CONFIG_IMX296 producer --name robot --stream audiovid
   for the ToF socket, approximate intrinsics are synthesized from the datasheet FoV (a warning is logged).
 
 The depth stream never enters the WebRTC/GStreamer pipeline; it is published to ROS only.
+`"tof_corrections": false` in the config json disables the EEPROM-based corrections (FPPN/wiggle/optical) —
+a degraded-accuracy fallback for modules whose calibration EEPROM cannot be read (I/O errors at boot).
 `scripts/probe_tof.py` from the pollen-vision repo inspects the device (sockets, sensors, EEPROM intrinsics).
 Note that the runtime copy of the config json ships inside the pollen-vision package
 (`config_files_vision/`); the copy in `config/` here is a mirror kept in sync for humans.

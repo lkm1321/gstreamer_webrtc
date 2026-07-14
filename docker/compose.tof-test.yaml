@@ -1,0 +1,18 @@
+services:
+  webrtc-tof-test:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.tof-test
+      args:
+        BASE_IMAGE: pollen-robotics/webrtc:latest # set to the image the robot runs today
+    image: webrtc:tof-test
+    network_mode: host # ROS 2 DDS + signalling server
+    privileged: true # depthai USB (device re-enumerates at boot, so a plain --device mapping is not enough)
+    volumes:
+      - /dev/bus/usb:/dev/bus/usb
+    environment:
+      - PYTHONOPTIMIZE=1 # required by the ros publishing loop (see main.py)
+      - ROS_DOMAIN_ID=${ROS_DOMAIN_ID:-0}
+    command: >
+      streaming_service --config CONFIG_IMX296 producer --name robot
+      --stream video --ros --tof --verbose
