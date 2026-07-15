@@ -64,9 +64,11 @@ Every ToF setting is exposed in the camera config json:
 - `"tof_config"`: the on-device ToF decoding (`fps`, phase unwrapping, and the FPPN/wiggle/optical/temperature
   corrections). Turning the corrections off is the degraded-accuracy fallback for a module whose calibration
   EEPROM cannot be read. The legacy `"tof_corrections": false` shorthand still works (it disables FPPN/wiggle/optical).
-- `"tof_filtering"`: an optional, configurable depth-cleanup chain (confidence threshold, then temporal, speckle,
-  spatial and median filters, applied in that order). Set `"enabled": false` to publish raw ToF depth. On the
-  OAK-FFC-4P (RVC2) these filters run on the host CPU (`"run_on_host": true`), so enabling them costs host cycles.
+- `"tof_filtering"`: the v3 ToF node's built-in confidence + image-filter chain, initialised from a `"preset"`
+  (`TOF_MID_RANGE`, `TOF_HIGH_RANGE` or `TOF_LOW_RANGE`) as the starting point. `"enabled": false` publishes the
+  decode-only depth (`tof.rawDepth`) — on the OAK-FFC-4P (RVC2) the preset filters run on the host CPU, so this
+  is the no-host-cost option; the on-device `tof_config` processing (median, phase-shuffle temporal filter, phase
+  unwrapping) still applies. `"enabled": true` publishes the preset-filtered depth (`tof.depth`).
 
 `scripts/probe_tof.py` from the pollen-vision repo inspects the device (sockets, sensors, EEPROM intrinsics).
 Note that the runtime copy of the config json ships inside the pollen-vision package
