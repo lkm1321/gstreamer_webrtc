@@ -206,6 +206,11 @@ def thread_ros_fun(
     rospublisher_right_cam = ROSPublisher(teleop_wrapper.cam_config, "right", asyncio_loop, stop_event)
     executor.add_node(rospublisher_left_cam)
     executor.add_node(rospublisher_right_cam)
+    if tof and not teleop_wrapper.cam_config.tof_enabled:
+        # --tof was passed but the camera config has no ToF ('tof': true), so the ToF pipeline was not
+        # built and no ToF socket / intrinsics exist. Skip the depth publisher instead of crashing.
+        logging.warning("--tof was set but the camera config does not enable ToF ('tof': true); skipping depth publisher")
+        tof = False
     if tof:
         depth_publisher = ROSDepthPublisher(teleop_wrapper.cam_config, asyncio_loop, stop_event)
         executor.add_node(depth_publisher)
