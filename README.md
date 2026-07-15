@@ -57,8 +57,17 @@ streaming_service --config CONFIG_IMX296 producer --name robot --stream audiovid
   for the ToF socket, approximate intrinsics are synthesized from the datasheet FoV (a warning is logged).
 
 The depth stream never enters the WebRTC/GStreamer pipeline; it is published to ROS only.
-`"tof_corrections": false` in the config json disables the EEPROM-based corrections (FPPN/wiggle/optical) —
-a degraded-accuracy fallback for modules whose calibration EEPROM cannot be read (I/O errors at boot).
+
+This path targets **depthai v3** (the ToF decoding, confidence filter and image filters are v3 nodes).
+Every ToF setting is exposed in the camera config json:
+
+- `"tof_config"`: the on-device ToF decoding (`fps`, phase unwrapping, and the FPPN/wiggle/optical/temperature
+  corrections). Turning the corrections off is the degraded-accuracy fallback for a module whose calibration
+  EEPROM cannot be read. The legacy `"tof_corrections": false` shorthand still works (it disables FPPN/wiggle/optical).
+- `"tof_filtering"`: an optional, configurable depth-cleanup chain (confidence threshold, then temporal, speckle,
+  spatial and median filters, applied in that order). Set `"enabled": false` to publish raw ToF depth. On the
+  OAK-FFC-4P (RVC2) these filters run on the host CPU (`"run_on_host": true`), so enabling them costs host cycles.
+
 `scripts/probe_tof.py` from the pollen-vision repo inspects the device (sockets, sensors, EEPROM intrinsics).
 Note that the runtime copy of the config json ships inside the pollen-vision package
 (`config_files_vision/`); the copy in `config/` here is a mirror kept in sync for humans.
