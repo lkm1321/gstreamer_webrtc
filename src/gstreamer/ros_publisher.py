@@ -46,24 +46,22 @@ class ROSPublisher(Node):  # type: ignore[misc]
         self._camera_info.r = R
         self._camera_info.p = P
 
-        asyncio.run_coroutine_threadsafe(self._publish_camera_info(side), asyncio_loop)
-
         self._logger.info(f"Node teleop_camera_publisher_{side} ready!")
 
     def publish_img(self, frame: bytes, latency_ns: int = 0) -> None:
-        """Read image from the requested side and publishes it."""
-        offset_duration = Duration(nanoseconds=latency_ns)
-        ts = self._clock.now() - offset_duration
-        self._compr_img.header.stamp = ts.to_msg()
-        self._compr_img.data = frame  # Note: there is probably a copy here, hence the high CPU usage
-        self._camera_publisher.publish(self._compr_img)
+        """Publishes the image together with its CameraInfo, sharing a single timestamp.
 
-    async def _publish_camera_info(self, side: str) -> None:
-        """Publish camera info for the requested side."""
-        while not self._stop_event.is_set():
-            self._camera_info.header.stamp = self._clock.now().to_msg()
-            self._camera_info_publisher.publish(self._camera_info)
-            await asyncio.sleep(1)
+        depth_image_proc (and other message_filters-based nodes) time-synchronize the image and its
+        CameraInfo, so the CameraInfo must be stamped with, and published alongside, each frame rather
+        than on an independent 1 Hz timer with unrelated stamps.
+        """
+        offset_duration = Duration(nanoseconds=latency_ns)
+        stamp = (self._clock.now() - offset_duration).to_msg()
+        self._compr_img.header.stamp = stamp
+        self._compr_img.data = frame  # Note: there is probably a copy here, hence the high CPU usage
+        self._camera_info.header.stamp = stamp
+        self._camera_publisher.publish(self._compr_img)
+        self._camera_info_publisher.publish(self._camera_info)
 
 
 class ROSDepthPublisher(Node):  # type: ignore[misc]
@@ -102,21 +100,18 @@ class ROSDepthPublisher(Node):  # type: ignore[misc]
         self._camera_info.r = np.eye(3).flatten()
         self._camera_info.p = [K[0], K[1], K[2], 0.0, K[3], K[4], K[5], 0.0, K[6], K[7], K[8], 0.0]
 
-        asyncio.run_coroutine_threadsafe(self._publish_camera_info(), asyncio_loop)
-
         self._logger.info("Node teleop_camera_publisher_depth ready!")
 
     def publish_depth(self, frame: npt.NDArray[np.uint16], latency_ns: int = 0) -> None:
-        """Publish a uint16 depth frame (millimeters)."""
-        offset_duration = Duration(nanoseconds=latency_ns)
-        ts = self._clock.now() - offset_duration
-        self._img.header.stamp = ts.to_msg()
-        self._img.data = frame.tobytes()
-        self._depth_publisher.publish(self._img)
+        """Publish a uint16 depth frame (millimeters) together with its CameraInfo, sharing a stamp.
 
-    async def _publish_camera_info(self) -> None:
-        """Publish the ToF camera info at 1 Hz."""
-        while not self._stop_event.is_set():
-            self._camera_info.header.stamp = self._clock.now().to_msg()
-            self._camera_info_publisher.publish(self._camera_info)
-            await asyncio.sleep(1)
+        depth_image_proc synchronizes the depth image and its CameraInfo, so both must carry the same
+        timestamp and be published together (not on an independent 1 Hz timer).
+        """
+        offset_duration = Duration(nanoseconds=latency_ns)
+        stamp = (self._clock.now() - offset_duration).to_msg()
+        self._img.header.stamp = stamp
+        self._img.data = frame.tobytes()
+        self._camera_info.header.stamp = stamp
+        self._depth_publisher.publish(self._img)
+        self._camera_info_publisher.publish(self._camera_info)
