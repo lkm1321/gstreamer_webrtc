@@ -1,0 +1,360 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>gstreamer-webrtc debug consumer</title>
+    <style>
+      :root { color-scheme: dark; }
+      body {
+        font-family: -apple-system, system-ui, sans-serif;
+        background: #111; color: #eee; margin: 0; padding: 16px;
+        display: grid; grid-template-columns: 1fr 360px; gap: 16px;
+        height: 100vh; box-sizing: border-box;
+      }
+      h1 { font-size: 14px; margin: 0 0 8px; color: #aaa; font-weight: 600; }
+      .panel { background: #1a1a1a; border: 1px solid #2a2a2a; border-radius: 6px; padding: 12px; }
+      .controls { display: flex; gap: 8px; margin-bottom: 12px; flex-wrap: wrap; }
+      input, button, select {
+        background: #222; color: #eee; border: 1px solid #333; border-radius: 4px;
+        padding: 6px 10px; font-size: 13px; font-family: inherit;
+      }
+      input { min-width: 260px; }
+      button { cursor: pointer; }
+      button:hover { background: #2a2a2a; }
+      button:disabled { opacity: 0.4; cursor: not-allowed; }
+      #status { font-size: 12px; color: #888; margin-left: auto; align-self: center; }
+      #videos { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+      .track { display: flex; flex-direction: column; gap: 4px; }
+      .track-label { font-size: 10px; color: #888; font-family: ui-monospace, Menlo, monospace; }
+      video, audio { width: 100%; background: #000; border-radius: 4px; }
+      #stats { font-family: ui-monospace, Menlo, monospace; font-size: 11px; white-space: pre; overflow: auto; height: calc(100vh - 120px); }
+      .right { display: flex; flex-direction: column; gap: 12px; min-width: 0; }
+      .hint { font-size: 11px; color: #777; line-height: 1.5; }
+      .hint code { background: #222; padding: 1px 5px; border-radius: 3px; }
+    </style>
+  </head>
+  <body>
+    <div class="panel">
+      <h1>STREAM</h1>
+      <div class="controls">
+        <input id="signalUrl" placeholder="ws://<robot-ip>:8443" />
+        <button id="connect">Connect</button>
+        <select id="producers"><option value="">(no producers)</option></select>
+        <button id="subscribe" disabled>Subscribe</button>
+        <button id="stop" disabled>Stop</button>
+        <span id="status">disconnected</span>
+      </div>
+      <div id="videos"></div>
+    </div>
+
+    <div class="right">
+      <div class="panel">
+        <h1>STATS (1 Hz)</h1>
+        <div id="stats">waiting for stream...</div>
+      </div>
+      <div class="panel">
+        <h1>RAW WS FRAMES <button id="clearWs" style="float:right;padding:2px 6px;font-size:11px">clear</button></h1>
+        <div id="wslog" style="font-family:ui-monospace,Menlo,monospace;font-size:10px;white-space:pre-wrap;overflow:auto;max-height:240px;color:#9cf"></div>
+      </div>
+      <div class="panel hint">
+        Open <code>chrome://webrtc-internals</code> in another tab while streaming for full graphs.
+        The active <code>RTCPeerConnection</code> is exposed as <code>window.pc</code> for ad-hoc console use,
+        e.g. <code>(await window.pc.getStats()).forEach(s =&gt; console.log(s))</code>.
+      </div>
+    </div>
+
+    <script type="module">
+      // gstwebrtc-api is the official JS client for gst-plugins-rs webrtcsink.
+      // Pinned to the ESM build of v3.0.0 on jsDelivr (latest on npm as of writing).
+      // If your robot ships a different gst-plugins-rs version and the signalling
+      // protocol doesn't match (symptom: WS connects, then disconnects within seconds),
+      // try an older client. Known versions on npm: 1.0.0, 2.0.0, 3.0.0.
+      // Swap the URL to e.g.:
+      //   .../gstwebrtc-api@2.0.0/dist/gstwebrtc-api-2.0.0.esm.js
+      //   .../gstwebrtc-api@1.0.0/dist/gstwebrtc-api-1.0.0.esm.js
+      const $ = (id) => document.getElementById(id);
+      const log = (msg) => { console.log(msg); $("status").textContent = msg; };
+
+      window.addEventListener("error", (e) => log(`script error: ${e.message}`));
+      window.addEventListener("unhandledrejection", (e) => log(`promise rejected: ${e.reason}`));
+
+      // Wrap WebSocket so we see every frame, regardless of what the API layer does with it.
+      const wslog = $("wslog");
+      const appendWs = (dir, data) => {
+        const ts = new Date().toLocaleTimeString();
+        let s = typeof data === "string" ? data : "[binary " + (data?.byteLength ?? "?") + "B]";
+        if (s.length > 800) s = s.slice(0, 800) + "…";
+        wslog.textContent += `${ts} ${dir} ${s}\n`;
+        wslog.scrollTop = wslog.scrollHeight;
+      };
+      $("clearWs").addEventListener("click", () => (wslog.textContent = ""));
+
+      const NativeWS = window.WebSocket;
+      window.WebSocket = function (url, protocols) {
+        appendWs("→○", `open ${url}`);
+        const ws = protocols ? new NativeWS(url, protocols) : new NativeWS(url);
+        ws.addEventListener("message", (e) => appendWs("◀", e.data));
+        ws.addEventListener("close", (e) => appendWs("✕", `code=${e.code} reason=${e.reason}`));
+        ws.addEventListener("error", () => appendWs("!", "error"));
+        const origSend = ws.send.bind(ws);
+        ws.send = (data) => { appendWs("▶", data); return origSend(data); };
+        return ws;
+      };
+      window.WebSocket.prototype = NativeWS.prototype;
+      window.WebSocket.CONNECTING = NativeWS.CONNECTING;
+      window.WebSocket.OPEN = NativeWS.OPEN;
+      window.WebSocket.CLOSING = NativeWS.CLOSING;
+      window.WebSocket.CLOSED = NativeWS.CLOSED;
+
+      let GstWebRTCAPI;
+      try {
+        ({ default: GstWebRTCAPI } = await import(
+          "https://cdn.jsdelivr.net/npm/gstwebrtc-api@3.0.0/dist/gstwebrtc-api-3.0.0.esm.js"
+        ));
+        log("library loaded — enter signalling URL and Connect");
+      } catch (e) {
+        log(`failed to load gstwebrtc-api: ${e.message}`);
+        throw e;
+      }
+
+      const defaultUrl = `ws://${location.hostname || "localhost"}:8443`;
+      $("signalUrl").value = localStorage.getItem("signalUrl") || defaultUrl;
+
+      let api = null;
+      let session = null;
+      let statsTimer = null;
+      const producers = new Map(); // id -> meta
+
+      function refreshProducerList() {
+        const sel = $("producers");
+        sel.innerHTML = "";
+        if (producers.size === 0) {
+          sel.innerHTML = '<option value="">(no producers)</option>';
+          $("subscribe").disabled = true;
+          return;
+        }
+        for (const [id, meta] of producers) {
+          const opt = document.createElement("option");
+          opt.value = id;
+          opt.textContent = `${meta?.name ?? "(unnamed)"} — ${id}`;
+          sel.appendChild(opt);
+        }
+        $("subscribe").disabled = false;
+      }
+
+      $("connect").addEventListener("click", () => {
+        const url = $("signalUrl").value.trim();
+        if (!url) return;
+        localStorage.setItem("signalUrl", url);
+
+        if (api) { try { api.close?.(); } catch {} }
+        producers.clear();
+        refreshProducerList();
+
+        api = new GstWebRTCAPI({
+          meta: { name: "win-debug-client" },
+          signalingServerUrl: url,
+        });
+
+        api.registerConnectionListener?.({
+          connected: (clientId) => log(`signalling connected (clientId=${clientId})`),
+          disconnected: () => log("signalling disconnected"),
+        });
+
+        // gstwebrtc-api 3.x exposes registerPeerListener / getAvailableProducers,
+        // but the older gst-plugins-rs signalling server on this robot only returns
+        // producers in response to an explicit {"type":"list"} request — it does NOT
+        // push peerStatusChanged for existing producers when a listener joins.
+        // So we discover producers ourselves over a side-channel WS, which we know
+        // works against this server (verified via wscat).
+        discoverProducers(url);
+
+        log(`connecting to ${url}…`);
+      });
+
+      function discoverProducers(url) {
+        let disco;
+        try {
+          disco = new NativeWS(url);  // bypass our wrapped logger to keep panel clean
+        } catch (e) {
+          log(`discovery WS failed to open: ${e.message}`);
+          return;
+        }
+        disco.addEventListener("open", () => {
+          disco.send(JSON.stringify({ type: "setPeerStatus", roles: ["listener"], meta: { name: "win-debug-discovery" } }));
+          disco.send(JSON.stringify({ type: "list" }));
+        });
+        disco.addEventListener("message", (e) => {
+          let msg;
+          try { msg = JSON.parse(e.data); } catch { return; }
+          if (msg.type === "list" && Array.isArray(msg.producers)) {
+            for (const p of msg.producers) {
+              producers.set(p.id, p.meta);
+            }
+            refreshProducerList();
+            log(`discovered ${msg.producers.length} producer(s)`);
+            disco.close();
+          }
+        });
+        disco.addEventListener("error", () => log("discovery WS error"));
+      }
+
+      $("subscribe").addEventListener("click", () => {
+        const peerId = $("producers").value;
+        if (!peerId || !api) return;
+
+        if (session) { try { session.close(); } catch {} }
+        $("videos").innerHTML = "";
+
+        session = api.createConsumerSession(peerId);
+
+        session.addEventListener("error", (e) => {
+          console.error("session error", e);
+          log(`session error: ${e?.message ?? e}`);
+        });
+
+        session.addEventListener("closed", () => {
+          log("session closed");
+          stopStats();
+        });
+
+        const renderTracks = () => {
+          $("videos").innerHTML = "";
+          const tracks = [];
+          for (const stream of session.streams) {
+            for (const t of stream.getTracks()) tracks.push(t);
+          }
+          // Fallback: pull from receivers in case a track isn't in any stream
+          if (session.peerConnection) {
+            for (const r of session.peerConnection.getReceivers()) {
+              if (r.track && !tracks.includes(r.track)) tracks.push(r.track);
+            }
+          }
+          let v = 0, a = 0;
+          for (const t of tracks) {
+            const wrap = document.createElement("div");
+            wrap.className = "track";
+            const label = document.createElement("div");
+            label.className = "track-label";
+            const el = document.createElement(t.kind === "video" ? "video" : "audio");
+            el.autoplay = true; el.playsInline = true;
+            if (t.kind === "video") {
+              v++;
+              el.muted = true;
+              label.textContent = `video ${v}  id=${t.id.slice(0, 8)}`;
+            } else {
+              a++;
+              el.controls = true;  // autoplay-with-sound is blocked; user toggles
+              label.textContent = `audio ${a}  id=${t.id.slice(0, 8)}  (unmute via controls)`;
+            }
+            el.srcObject = new MediaStream([t]);
+            wrap.appendChild(label);
+            wrap.appendChild(el);
+            $("videos").appendChild(wrap);
+            el.play().catch((err) => console.warn("autoplay blocked:", err));
+          }
+          log(`tracks: ${v} video + ${a} audio`);
+        };
+
+        session.addEventListener("streamsChanged", () => {
+          window.pc = session.peerConnection;
+          renderTracks();
+          startStats();
+        });
+
+        // Some tracks may arrive after streamsChanged (separate m-line negotiation).
+        // Hook ontrack so we re-render whenever a new track shows up.
+        const installOnTrack = () => {
+          if (!session.peerConnection || session.peerConnection.__onTrackHooked) return;
+          session.peerConnection.__onTrackHooked = true;
+          session.peerConnection.addEventListener("track", () => {
+            window.pc = session.peerConnection;
+            renderTracks();
+            if (!statsTimer) startStats();
+          });
+        };
+        // Poll briefly for the peerConnection to exist (created during connect()).
+        const hookTimer = setInterval(() => {
+          if (session.peerConnection) { installOnTrack(); clearInterval(hookTimer); }
+        }, 100);
+        setTimeout(() => clearInterval(hookTimer), 5000);
+
+        session.connect();
+        $("stop").disabled = false;
+      });
+
+      $("stop").addEventListener("click", () => {
+        if (session) { try { session.close(); } catch {} session = null; }
+        $("videos").innerHTML = "";
+        $("stop").disabled = true;
+        stopStats();
+        log("stopped");
+      });
+
+      // ---- stats ----
+      let prev = null;
+      function startStats() {
+        stopStats();
+        statsTimer = setInterval(pollStats, 1000);
+      }
+      function stopStats() {
+        if (statsTimer) clearInterval(statsTimer);
+        statsTimer = null;
+        prev = null;
+      }
+      async function pollStats() {
+        if (!session?.peerConnection) return;
+        const report = await session.peerConnection.getStats();
+        const inbound = [];
+        let candidatePair = null;
+        report.forEach((s) => {
+          if (s.type === "inbound-rtp" && s.kind === "video") inbound.push(s);
+          if (s.type === "candidate-pair" && s.nominated && s.state === "succeeded") candidatePair = s;
+        });
+
+        const lines = [];
+        const now = performance.now();
+        const dt = prev ? (now - prev.t) / 1000 : null;
+
+        for (const s of inbound) {
+          const p = prev?.byId.get(s.id);
+          const bps = p && dt ? Math.round(((s.bytesReceived - p.bytesReceived) * 8) / dt) : null;
+          const fps = p && dt ? +((s.framesDecoded - p.framesDecoded) / dt).toFixed(1) : null;
+          const lostDelta = p ? s.packetsLost - p.packetsLost : 0;
+          const recvDelta = p ? s.packetsReceived - p.packetsReceived : 0;
+          const lossPct = recvDelta + lostDelta > 0
+            ? ((lostDelta / (recvDelta + lostDelta)) * 100).toFixed(2)
+            : "0.00";
+
+          lines.push(`ssrc ${s.ssrc}  ${s.codecId ? "(" + (s.mimeType || "") + ")" : ""}`);
+          lines.push(`  bitrate     : ${bps !== null ? (bps / 1000).toFixed(0) + " kbps" : "—"}`);
+          lines.push(`  fps decoded : ${fps !== null ? fps : "—"}`);
+          lines.push(`  frames recv : ${s.framesReceived ?? "—"}  decoded ${s.framesDecoded ?? "—"}  dropped ${s.framesDropped ?? 0}`);
+          lines.push(`  pkts loss   : ${lossPct}%  (+${lostDelta} this tick, total ${s.packetsLost})`);
+          lines.push(`  jitter      : ${s.jitter !== undefined ? (s.jitter * 1000).toFixed(2) + " ms" : "—"}`);
+          lines.push(`  nack/pli    : ${s.nackCount ?? 0} / ${s.pliCount ?? 0}`);
+          lines.push(`  jb delay    : ${s.jitterBufferDelay !== undefined && s.jitterBufferEmittedCount
+              ? (1000 * s.jitterBufferDelay / s.jitterBufferEmittedCount).toFixed(1) + " ms"
+              : "—"}`);
+          lines.push("");
+        }
+
+        if (candidatePair) {
+          lines.push(`rtt          : ${candidatePair.currentRoundTripTime !== undefined
+              ? (candidatePair.currentRoundTripTime * 1000).toFixed(1) + " ms"
+              : "—"}`);
+          lines.push(`local/remote : ${candidatePair.localCandidateId} / ${candidatePair.remoteCandidateId}`);
+        }
+
+        if (!inbound.length) lines.push("(no inbound video yet)");
+
+        $("stats").textContent = lines.join("\n");
+
+        prev = {
+          t: now,
+          byId: new Map(inbound.map((s) => [s.id, s])),
+        };
+      }
+    </script>
+  </body>
+</html>

@@ -1,0 +1,10 @@
+# Build from the cameras workspace containing both repositories:
+# docker build -f gstreamer_webrtc/docker/Dockerfile.depth -t webrtc:depth-fixed .
+ARG BASE_IMAGE=pollenrobotics/webrtc:2.1.0.1_development_tof
+FROM ${BASE_IMAGE}
+# This base contains DepthAI 3.8.0 and the robot's GStreamer/ROS runtime.
+# Prefer these checked-out sources over the base image's editable pip installs.
+COPY pollen-vision/pollen_vision/pollen_vision /opt/reachy-camera/pollen_vision/pollen_vision
+COPY pollen-vision/pollen_vision/config_files_vision /opt/reachy-camera/pollen_vision/config_files_vision
+COPY gstreamer_webrtc/src/gstreamer /opt/reachy-camera/src/gstreamer
+ENV PYTHONPATH=/opt/reachy-camera/pollen_vision:/opt/reachy-camera/src

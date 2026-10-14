@@ -42,38 +42,38 @@ python src/gstreamer/simple_consumer.py consumer --remote-producer-peer-id <peer
 ```
 THe peer_id can be get in the log of the signalling server
 
-### Head ToF depth (Reachy 2)
+### Head depth (Reachy 2)
 
-If the camera config json contains `"tof": true` (see `CONFIG_IMX296.json`), the depthai pipeline
-decodes the head ToF module on-device. The ToF board socket is auto-detected at runtime (the only
-sensor reporting the ToF type). Add `--tof` (requires `--ros` and a video stream) to publish it to ROS:
+Depth is opt-in. Select `--depth-mode stereo` to compute depth from the two RGB
+cameras, or `--depth-mode tof` (`--tof` also works) for the head ToF sensor.
+Both require `--ros` and a video stream. With `--depth-mode off` (the default),
+no depth nodes run, regardless of the config's legacy `"tof"` key.
 
 ```console
-streaming_service --config CONFIG_IMX296 producer --name robot --stream audiovideo --ros --tof
+streaming_service producer --config CONFIG_IMX296 --name robot --stream audiovideo --ros --depth-mode stereo --depth-fps 15
 ```
 
-- `teleop_camera/depth/image_raw`: `sensor_msgs/Image`, encoding `16UC1`, raw depth in **millimeters** (no scaling).
-- `teleop_camera/depth/camera_info`: `sensor_msgs/CameraInfo` at 1 Hz. If the device EEPROM has no intrinsics
-  for the ToF socket, approximate intrinsics are synthesized from the datasheet FoV (a warning is logged).
+- `teleop_camera/depth/image_raw`: `sensor_msgs/Image`, `16UC1`, millimeters; zero means invalid depth.
+- `teleop_camera/depth/camera_info`: published with each depth image, with the same timestamp.
+- Stereo: 640×480, 15 fps by default (use `--depth-fps`, at most `--fps`), aligned to
+  `left_camera_optical`. Uses independent, unrectified grayscale camera outputs,
+  left/right consistency checking, subpixel disparity, speckle rejection and a 0.2–10 m range.
+- ToF: sensor socket is auto-detected; decoding settings remain in `tof_config`.
+  The rate is bounded by `--depth-fps` and capped at 10 fps to preserve RGB on RVC2.
+  `tof_filtering.enabled` adds a 5×5 median filter and temporal smoothing within 100 mm
+  in the depth reader thread. The former DepthAI host-filter presets are no longer used:
+  that graph stalled the RGB encoders on RVC2. Missing ToF intrinsics still use an
+  approximate datasheet-based fallback with a warning.
 
-The depth stream never enters the WebRTC/GStreamer pipeline; it is published to ROS only.
+Depth has its own queue and reader thread and is published only to ROS. H264 and
+MJPEG RGB streams continue independently. Stereo needs texture and overlapping views;
+blank surfaces, glass and occlusions can produce invalid pixels. USB3 is recommended.
+Runtime camera configs ship in pollen-vision's `config_files_vision/`; `config/` here is a mirror.
 
-This path targets **depthai v3** (the ToF decoding, confidence filter and image filters are v3 nodes).
-Every ToF setting is exposed in the camera config json:
-
-- `"tof_config"`: the on-device ToF decoding (`fps`, phase unwrapping, and the FPPN/wiggle/optical/temperature
-  corrections). Turning the corrections off is the degraded-accuracy fallback for a module whose calibration
-  EEPROM cannot be read. The legacy `"tof_corrections": false` shorthand still works (it disables FPPN/wiggle/optical).
-- `"tof_filtering"`: the v3 ToF node's built-in confidence + image-filter chain, initialised from a `"preset"`
-  (`TOF_MID_RANGE`, `TOF_HIGH_RANGE` or `TOF_LOW_RANGE`) as the starting point. `"enabled": false` publishes the
-  decode-only depth (`tof.rawDepth`) — on the OAK-FFC-4P (RVC2) the preset filters run on the host CPU, so this
-  is the no-host-cost option; the on-device `tof_config` processing (median, phase-shuffle temporal filter, phase
-  unwrapping) still applies. `"enabled": true` publishes the preset-filtered depth (`tof.depth`).
-
-`scripts/probe_tof.py` from the pollen-vision repo inspects the device (sockets, sensors, EEPROM intrinsics).
-Note that the runtime copy of the config json ships inside the pollen-vision package
-(`config_files_vision/`); the copy in `config/` here is a mirror kept in sync for humans.
-Known limits: the ToF is validated on USB3; on `--force-usb2` the raw ToF stream (~18 MB/s) may saturate the link.
+For deployment, `docker/Dockerfile.depth` builds both local checkouts over the robot's
+existing ToF image. Run its build command from their common `cameras` directory, then
+set the camera service image to the result and append `--depth-mode stereo --depth-fps 15`.
+The signalling server and gRPC bridge can retain their existing images.
 
 ## Debugging
 

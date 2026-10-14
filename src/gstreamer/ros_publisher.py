@@ -4,6 +4,7 @@ import logging
 import numpy as np
 import numpy.typing as npt
 from pollen_vision.camera_wrappers.depthai.cam_config import CamConfig
+from pollen_vision.camera_wrappers.depthai.utils import get_socket_from_name
 from rclpy.duration import Duration
 from rclpy.node import Node
 from sensor_msgs.msg import CameraInfo
@@ -13,12 +14,17 @@ from sensor_msgs.msg._image import Image
 
 class ROSPublisher(Node):  # type: ignore[misc]
     def __init__(
-        self, cam_config: CamConfig, side: str, asyncio_loop: asyncio.AbstractEventLoop, stop_event: asyncio.Event
+        self,
+        cam_config: CamConfig,
+        side: str,
+        asyncio_loop: asyncio.AbstractEventLoop,
+        stop_event: asyncio.Event,
     ) -> None:
         super().__init__(f"teleop_camera_publisher_{side}")
         self._logger = logging.getLogger(__name__)
         self._stop_event = stop_event
         self._clock = self.get_clock()
+        self._cam_config = cam_config
         self._side = side
 
         self._camera_publisher = self.create_publisher(
@@ -57,6 +63,11 @@ class ROSPublisher(Node):  # type: ignore[misc]
         """
         offset_duration = Duration(nanoseconds=latency_ns)
         stamp = (self._clock.now() - offset_duration).to_msg()
+        intrinsics = self._cam_config.rgb_intrinsics.get(self._side)
+        if intrinsics is not None:
+            K = np.array(intrinsics)
+            self._camera_info.k = K.flatten().tolist()
+            self._camera_info.p = np.column_stack((K, np.zeros(3))).flatten().tolist()
         self._compr_img.header.stamp = stamp
         self._compr_img.data = frame  # Note: there is probably a copy here, hence the high CPU usage
         self._camera_info.header.stamp = stamp
@@ -65,21 +76,33 @@ class ROSPublisher(Node):  # type: ignore[misc]
 
 
 class ROSDepthPublisher(Node):  # type: ignore[misc]
-    """Publishes the head ToF depth map as a sensor_msgs/Image (16UC1, millimeters)."""
+    """Publishes the selected depth map as a sensor_msgs/Image (16UC1, millimeters)."""
 
-    def __init__(self, cam_config: CamConfig, asyncio_loop: asyncio.AbstractEventLoop, stop_event: asyncio.Event) -> None:
+    def __init__(
+        self,
+        cam_config: CamConfig,
+        asyncio_loop: asyncio.AbstractEventLoop,
+        stop_event: asyncio.Event,
+    ) -> None:
         super().__init__("teleop_camera_publisher_depth")
         self._logger = logging.getLogger(__name__)
         self._stop_event = stop_event
         self._clock = self.get_clock()
+        self._cam_config = cam_config
 
-        height, width, distortion_model, D, K = cam_config.get_tof_camera_info()
+        if cam_config.depth_mode == "stereo":
+            width, height = cam_config.depth_resolution
+            socket = get_socket_from_name("left", cam_config.name_to_socket)
+            K = np.array(cam_config.calib.getCameraIntrinsics(socket, width, height)).flatten().tolist()
+            distortion_model, D = "plumb_bob", [0.0] * 5
+        else:
+            height, width, distortion_model, D, K = cam_config.get_tof_camera_info()
 
         self._depth_publisher = self.create_publisher(Image, "teleop_camera/depth/image_raw", 1)
         self._logger.info(f'Launching "{self._depth_publisher.topic_name}" publisher.')
 
         self._img = Image()
-        self._img.header.frame_id = "tof_camera_optical"
+        self._img.header.frame_id = "left_camera_optical" if cam_config.depth_mode == "stereo" else "tof_camera_optical"
         self._img.height = height
         self._img.width = width
         self._img.encoding = "16UC1"
@@ -96,9 +119,22 @@ class ROSDepthPublisher(Node):  # type: ignore[misc]
         self._camera_info.distortion_model = distortion_model
         self._camera_info.d = D
         self._camera_info.k = K
-        # The ToF is not part of the stereo rectification: identity rotation, P is K with a zero translation column.
+        # Depth is in the selected camera optical frame; P is K with zero translation.
         self._camera_info.r = np.eye(3).flatten()
-        self._camera_info.p = [K[0], K[1], K[2], 0.0, K[3], K[4], K[5], 0.0, K[6], K[7], K[8], 0.0]
+        self._camera_info.p = [
+            K[0],
+            K[1],
+            K[2],
+            0.0,
+            K[3],
+            K[4],
+            K[5],
+            0.0,
+            K[6],
+            K[7],
+            K[8],
+            0.0,
+        ]
 
         self._logger.info("Node teleop_camera_publisher_depth ready!")
 
@@ -110,6 +146,11 @@ class ROSDepthPublisher(Node):  # type: ignore[misc]
         """
         offset_duration = Duration(nanoseconds=latency_ns)
         stamp = (self._clock.now() - offset_duration).to_msg()
+        intrinsics = self._cam_config.depth_intrinsics
+        if intrinsics is not None:
+            K = np.array(intrinsics)
+            self._camera_info.k = K.flatten().tolist()
+            self._camera_info.p = np.column_stack((K, np.zeros(3))).flatten().tolist()
         self._img.header.stamp = stamp
         self._img.data = frame.tobytes()
         self._camera_info.header.stamp = stamp

@@ -91,18 +91,30 @@ def parse_args() -> argparse.Namespace:
         help="Disable hardware rectification",
     )
     parser.add_argument("--ros", action="store_true", help="pusblish camera images to ROS")
-    parser.add_argument(
+    depth_group = parser.add_mutually_exclusive_group()
+    depth_group.add_argument(
         "--tof",
         action="store_true",
-        help="publish the head ToF depth map to ROS (requires --ros and a video stream)",
+        help="publish ToF depth to ROS (alias for --depth-mode tof)",
     )
+    depth_group.add_argument(
+        "--depth-mode",
+        choices=["off", "tof", "stereo"],
+        default="off",
+        help="ROS depth source (default: off)",
+    )
+    parser.add_argument("--depth-fps", type=int, default=15, help="depth FPS (default: 15; ToF limited to 10 to preserve RGB)")
 
     add_signaling_arguments(parser)  # signalling args
 
     args = parser.parse_args()
 
-    if args.tof and (not args.ros or args.stream == "audio"):
-        parser.error("--tof requires --ros and a video stream (--stream video or audiovideo)")
+    if args.tof:
+        args.depth_mode = "tof"
+    if args.depth_mode != "off" and (not args.ros or args.stream == "audio"):
+        parser.error("depth requires --ros and a video stream (--stream video or audiovideo)")
+    if not 1 <= args.depth_fps <= args.fps:
+        parser.error("--depth-fps must be between 1 and --fps")
 
     return args
 
@@ -136,6 +148,8 @@ def configure_camera(args: argparse.Namespace) -> TeleopWrapper:
             force_usb2=args.force_usb2,
             exposure_params=exposure_params,
             mx_id=head_mx_id,
+            depth_mode=args.depth_mode,
+            depth_fps=args.depth_fps,
         )
 
     return teleop_wrapper
@@ -148,12 +162,12 @@ def compute_camera_latency(teleop_wrapper: TeleopWrapper) -> int:
     if teleop_wrapper is not None:
         for _ in range(30):  # sample of 30 frames. first latencies are usually not accurate
             _, latency, _ = teleop_wrapper.get_data_h264()
-            latencies.append(latency["left"].microseconds * 1000)  # to ns
+            latencies.append(int(latency["left"].total_seconds() * 1_000_000_000))  # to ns
 
     # tip gstreamer: reduce latency of one frame since h264parse is adding one frame latency
     offset = (int)(1.0 / teleop_wrapper.cam_config.fps * 1_000_000_000)
 
-    return min(latencies) - offset
+    return max(0, min(latencies) - offset)
 
 
 def configure_pipeline(
@@ -186,19 +200,25 @@ def configure_pipeline(
     return avpipeline, video_left, video_right
 
 
-def thread_tof_fun(teleop_wrapper: TeleopWrapper, depth_publisher: ROSDepthPublisher, stop_event: asyncio.Event) -> None:
-    """Drains the ToF depth queue and publishes to ROS.
+def thread_depth_fun(
+    teleop_wrapper: TeleopWrapper,
+    depth_publisher: ROSDepthPublisher,
+    stop_event: asyncio.Event,
+) -> None:
+    """Drains the selected depth queue and publishes to ROS.
 
-    Runs in its own thread: get_data_tof() blocks at the ToF fps, which must stay decoupled
+    Runs in its own thread: get_data_depth() blocks at the depth fps, which must stay decoupled
     from the MJPEG-paced loop of thread_ros_fun.
     """
     while not stop_event.is_set():
-        frame, latency, _ = teleop_wrapper.get_data_tof()
-        depth_publisher.publish_depth(frame, latency.microseconds * 1000)
+        frame, latency, _ = teleop_wrapper.get_data_depth()
+        depth_publisher.publish_depth(frame, int(latency.total_seconds() * 1_000_000_000))
 
 
 def thread_ros_fun(
-    teleop_wrapper: TeleopWrapper, asyncio_loop: asyncio.AbstractEventLoop, stop_event: asyncio.Event, tof: bool
+    teleop_wrapper: TeleopWrapper,
+    asyncio_loop: asyncio.AbstractEventLoop,
+    stop_event: asyncio.Event,
 ) -> None:
     rclpy.init()
     executor = MultiThreadedExecutor()
@@ -206,22 +226,27 @@ def thread_ros_fun(
     rospublisher_right_cam = ROSPublisher(teleop_wrapper.cam_config, "right", asyncio_loop, stop_event)
     executor.add_node(rospublisher_left_cam)
     executor.add_node(rospublisher_right_cam)
-    if tof and not teleop_wrapper.cam_config.tof_enabled:
-        # --tof was passed but the camera config has no ToF ('tof': true), so the ToF pipeline was not
-        # built and no ToF socket / intrinsics exist. Skip the depth publisher instead of crashing.
-        logging.warning("--tof was set but the camera config does not enable ToF ('tof': true); skipping depth publisher")
-        tof = False
-    if tof:
+    if teleop_wrapper.depth_mode != "off":
         depth_publisher = ROSDepthPublisher(teleop_wrapper.cam_config, asyncio_loop, stop_event)
         executor.add_node(depth_publisher)
-        thread_tof = Thread(target=thread_tof_fun, args=(teleop_wrapper, depth_publisher, stop_event), daemon=True)
-        thread_tof.start()
+        thread_depth = Thread(
+            target=thread_depth_fun,
+            args=(teleop_wrapper, depth_publisher, stop_event),
+            daemon=True,
+        )
+        thread_depth.start()
     executor_thread = Thread(target=executor.spin, daemon=True)
     executor_thread.start()
     while not stop_event.is_set():
         data, latency, _ = teleop_wrapper.get_data_mjpeg()
-        rospublisher_left_cam.publish_img(data["left_mjpeg"].tobytes(), latency["left_mjpeg"].microseconds * 1000)
-        rospublisher_right_cam.publish_img(data["right_mjpeg"].tobytes(), latency["right_mjpeg"].microseconds * 1000)
+        rospublisher_left_cam.publish_img(
+            data["left_mjpeg"].tobytes(),
+            int(latency["left_mjpeg"].total_seconds() * 1_000_000_000),
+        )
+        rospublisher_right_cam.publish_img(
+            data["right_mjpeg"].tobytes(),
+            int(latency["right_mjpeg"].total_seconds() * 1_000_000_000),
+        )
         time.sleep(0.005)  # requires export PYTHONOPTIMIZE=1 to avoid a drop of performance
     # executor.shutdown()
 
@@ -242,7 +267,9 @@ async def main_loop(args: argparse.Namespace) -> None:
 
     if args.ros:
         thread_ros = Thread(
-            target=thread_ros_fun, args=(teleop_wrapper, asyncio.get_event_loop(), stop_event, args.tof), daemon=True
+            target=thread_ros_fun,
+            args=(teleop_wrapper, asyncio.get_event_loop(), stop_event),
+            daemon=True,
         )
         thread_ros.start()
 
@@ -251,8 +278,16 @@ async def main_loop(args: argparse.Namespace) -> None:
             if teleop_wrapper:
                 data, latency, _ = teleop_wrapper.get_data_h264()
                 # print(str(latency))
-                avpipeline.push_frame(video_left, data["left"], latency["left"].microseconds * 1000)
-                avpipeline.push_frame(video_right, data["right"], latency["right"].microseconds * 1000)
+                avpipeline.push_frame(
+                    video_left,
+                    data["left"],
+                    int(latency["left"].total_seconds() * 1_000_000_000),
+                )
+                avpipeline.push_frame(
+                    video_right,
+                    data["right"],
+                    int(latency["right"].total_seconds() * 1_000_000_000),
+                )
                 # get_data is blocking. giving space to async methods
                 await asyncio.sleep(0)
             else:
